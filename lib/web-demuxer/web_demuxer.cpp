@@ -2,35 +2,64 @@
 #include <sstream>
 #include <cstdint>
 #include <vector>
+#include <map>
 #include <emscripten.h>
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
 
 using namespace emscripten;
 
-extern "C"
-{
+extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
-#include <libavutil/display.h>
-#include <libavutil/pixdesc.h>
 #include <libavcodec/codec_id.h>
-#include "video_codec_string.h"
 #include "audio_codec_string.h"
-};
+}
 
-typedef struct Tag
-{
+int read_av_packet(intptr_t context_handle, double start, double end, int type, int wanted_stream_nb, int seek_flag, val js_caller);
+
+typedef struct DemuxerContext {
+    AVFormatContext *fmt_ctx;
+    AVIOContext *avio_ctx;
+    val io_handler;
+    uint8_t *avio_ctx_buffer;
+} DemuxerContext;
+
+std::map<intptr_t, DemuxerContext*> context_map;
+
+int read_packet(void *opaque, uint8_t *buf, int buf_size) {
+    DemuxerContext *ctx = (DemuxerContext *)opaque;
+    val result = ctx->io_handler.call<val>("read", buf_size).await();
+    val buffer = result["buffer"];
+    int bytes_read = result["bytesRead"].as<int>();
+    if (bytes_read > 0) {
+        val memoryView = val(typed_memory_view(bytes_read, buf));
+        memoryView.call<void>("set", buffer);
+    }
+    return bytes_read > 0 ? bytes_read : AVERROR_EOF;
+}
+
+int64_t seek(void *opaque, int64_t offset, int whence) {
+    DemuxerContext *ctx = (DemuxerContext *)opaque;
+    if (whence == AVSEEK_SIZE) {
+        double size_double = ctx->io_handler.call<val>("getSize").await().as<double>();
+        int64_t size_i64 = (int64_t)size_double;
+        return size_i64;
+    }
+    double new_pos_double = ctx->io_handler.call<val>("seek", (double)offset, (double)whence).await().as<double>();
+    int64_t new_pos_i64 = (int64_t)new_pos_double;
+    return new_pos_i64;
+}
+
+typedef struct Tag {
     std::string key;
     std::string value;
 } Tag;
 
-typedef struct WebAVStream
-{
+typedef struct WebAVStream {
     int index;
     int id;
-    /** Codec Info from codecpar */
     int codec_type;
     std::string codec_type_string;
     std::string codec_name;
@@ -40,30 +69,16 @@ typedef struct WebAVStream
     std::string bit_rate;
     int extradata_size;
     std::vector<uint8_t> extradata;
-    val get_extradata() const{
+    val get_extradata() const {
         return val(typed_memory_view(extradata.size(), extradata.data()));
     }
-    /** Video-specific Info */
-    int width;
-    int height;
-    std::string pix_fmt;
-    std::string color_primaries;
-    std::string color_transfer;
-    std::string color_space;
-    std::string color_range;
-    std::string r_frame_rate;
-    std::string avg_frame_rate;
-    std::string sample_aspect_ratio;
-    std::string display_aspect_ratio;
-    double rotation;
-    /** Audio-specific Info */
     int channels;
     int sample_rate;
     std::string sample_fmt;
-    /** Other Common Info */
     double start_time;
     double duration;
     std::string nb_frames;
+    std::string mime_type;
     std::vector<Tag> tags;
     val get_tags() const {
         val tags = val::object();
@@ -74,32 +89,19 @@ typedef struct WebAVStream
     }
 } WebAVStream;
 
-typedef struct WebAVPacket
-{
+typedef struct WebAVPacket {
+    int stream_index;
     int keyframe;
     double timestamp;
     double duration;
     int size;
     std::vector<uint8_t> data;
-    val get_data() const{
+    val get_data() const {
         return val(typed_memory_view(data.size(), data.data()));
     }
 } WebAVPacket;
 
-typedef struct WebAVStreamList
-{
-    int size;
-    std::vector<WebAVStream> streams;
-} WebAVStreamList;
-
-typedef struct WebAVPacketList
-{
-    int size;
-    std::vector<WebAVPacket> packets;
-} WebAVPacketList;
-
-typedef struct WebMediaInfo
-{
+typedef struct WebMediaInfo {
     std::string format_name;
     double start_time;
     double duration;
@@ -110,24 +112,7 @@ typedef struct WebMediaInfo
     std::vector<WebAVStream> streams;
 } WebMediaInfo;
 
-double get_rotation(AVStream *stream) {
-   for (int i = 0; i < stream->codecpar->nb_coded_side_data; i++) {
-        AVPacketSideData *sd = &stream->codecpar->coded_side_data[i];
-
-        if (sd->type == AV_PKT_DATA_DISPLAYMATRIX && sd->size >= 9*4) {
-            double rotation = av_display_rotation_get((int32_t *)sd->data);
-            if (std::isnan(rotation))
-                rotation = 0;
-            
-            return rotation;
-        }
-    }
-
-    return 0;
-}
-
-std::string gen_rational_str(AVRational rational, char sep)
-{
+std::string gen_rational_str(AVRational rational, char sep) {
     std::ostringstream oss;
     oss << rational.num << sep << rational.den;
     return oss.str();
@@ -137,237 +122,156 @@ inline std::string safe_str(const char* str) {
     return str ? str : "";
 }
 
-void gen_web_packet(WebAVPacket &web_packet, AVPacket *packet, AVStream *stream)
-{
+std::string get_audio_mime_type(AVCodecID codec_id) {
+    switch (codec_id) {
+        case AV_CODEC_ID_MP3:
+            return "audio/mpeg";
+        case AV_CODEC_ID_AAC:
+            return "audio/aac";
+        case AV_CODEC_ID_AC3:
+            return "audio/ac3";
+        case AV_CODEC_ID_EAC3:
+            return "audio/eac3";
+        case AV_CODEC_ID_FLAC:
+            return "audio/flac";
+        case AV_CODEC_ID_VORBIS:
+            return "audio/vorbis";
+        case AV_CODEC_ID_OPUS:
+            return "audio/opus";
+        case AV_CODEC_ID_PCM_S16LE:
+        case AV_CODEC_ID_PCM_S16BE:
+        case AV_CODEC_ID_PCM_U16LE:
+        case AV_CODEC_ID_PCM_U16BE:
+        case AV_CODEC_ID_PCM_ALAW:
+        case AV_CODEC_ID_PCM_MULAW:
+            return "audio/wav";
+        default:
+            return "application/octet-stream";
+    }
+}
+void gen_web_packet(WebAVPacket &web_packet, AVPacket *packet, AVStream *stream) {
     double packet_timestamp = 0;
-
     if (packet->pts != AV_NOPTS_VALUE) {
         packet_timestamp = packet->pts * av_q2d(stream->time_base);
-    }
-    else if (packet->dts != AV_NOPTS_VALUE) {
-        // Some formats such as AVI do not have PTS and use DTS instead
+    } else if (packet->dts != AV_NOPTS_VALUE) {
         packet_timestamp = packet->dts * av_q2d(stream->time_base);
     }
-
+    web_packet.stream_index = packet->stream_index;
     web_packet.keyframe = packet->flags & AV_PKT_FLAG_KEY;
     web_packet.timestamp = packet_timestamp;
     web_packet.duration = packet->duration * av_q2d(stream->time_base);
     web_packet.size = packet->size;
-    if (packet->size > 0)
-    {
+    if (packet->size > 0) {
         web_packet.data = std::vector<uint8_t>(packet->data, packet->data + packet->size);
     }
-    else
-    {
+    else {
         web_packet.data = std::vector<uint8_t>();
     }
 }
 
-void gen_web_stream(WebAVStream &web_stream, AVStream *stream, AVFormatContext *fmt_ctx)
-{
+void gen_web_stream(WebAVStream &web_stream, AVStream *stream, AVFormatContext *fmt_ctx) {
     web_stream.index = stream->index;
     web_stream.id = stream->id;
-
-    // Initialize codec info
     AVCodecParameters *par = stream->codecpar;
     web_stream.codec_type = (int)par->codec_type;
     web_stream.codec_type_string = safe_str(av_get_media_type_string(par->codec_type));
-    
     const AVCodecDescriptor* desc = avcodec_descriptor_get(par->codec_id);
     web_stream.codec_name = safe_str(desc ? desc->name : "");
 
-    // Initialize video-specific values
-    web_stream.width = 0;
-    web_stream.height = 0;
-    web_stream.color_primaries = "";
-    web_stream.color_transfer = "";
-    web_stream.color_space = "";
-    web_stream.color_range = "";
-    web_stream.pix_fmt = "";
-    web_stream.r_frame_rate = "0/0";
-    web_stream.avg_frame_rate = "0/0";
-    web_stream.rotation = 0;
-    web_stream.sample_aspect_ratio = "N/A";
-    web_stream.display_aspect_ratio = "N/A";
-    // Initialize audio-specific values
-    web_stream.channels = 0;
-    web_stream.sample_rate = 0;
-    web_stream.sample_fmt = "";
-
     char codec_string[40];
-
-    if (par->codec_type == AVMEDIA_TYPE_VIDEO)
-    {
-        // Video-specific properties
-        web_stream.width = par->width;
-        web_stream.height = par->height;
-        web_stream.color_primaries = safe_str(av_color_primaries_name(par->color_primaries));
-        web_stream.color_transfer = safe_str(av_color_transfer_name(par->color_trc));
-        web_stream.color_space = safe_str(av_color_space_name(par->color_space));
-        web_stream.color_range = safe_str(av_color_range_name(par->color_range));
-        web_stream.pix_fmt = safe_str(av_get_pix_fmt_name((AVPixelFormat)par->format));
-        web_stream.r_frame_rate = gen_rational_str(stream->r_frame_rate, '/');
-        web_stream.avg_frame_rate = gen_rational_str(stream->avg_frame_rate, '/');
-        web_stream.rotation = get_rotation(stream);
-        
-        AVRational sar = av_guess_sample_aspect_ratio(fmt_ctx, stream, NULL);
-        if (sar.num) {
-            AVRational dar;
-            av_reduce(&dar.num, &dar.den, par->width * sar.num, par->height * sar.den, 1024 * 1024);
-            web_stream.sample_aspect_ratio = gen_rational_str(sar, ':');
-            web_stream.display_aspect_ratio = gen_rational_str(dar, ':');
-        }
-        
-        set_video_codec_string(codec_string, sizeof(codec_string), par, &stream->avg_frame_rate);
-    }
-    else if (par->codec_type == AVMEDIA_TYPE_AUDIO)
-    {
-        // Audio-specific properties
+    if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
         web_stream.channels = par->ch_layout.nb_channels;
         web_stream.sample_rate = par->sample_rate;
         web_stream.sample_fmt = safe_str(av_get_sample_fmt_name((AVSampleFormat)par->format));
         set_audio_codec_string(codec_string, sizeof(codec_string), par);
-    }
-    else
-    {
+        web_stream.mime_type = get_audio_mime_type(par->codec_id);
+    } else {
         strcpy(codec_string, "undf");
     }
-
-    // Common properties for all types
     web_stream.codec_string = safe_str(codec_string);
     web_stream.profile = safe_str(avcodec_profile_name(par->codec_id, par->profile));
     web_stream.level = par->level;
     web_stream.bit_rate = std::to_string(par->bit_rate);
-    
     web_stream.extradata_size = par->extradata_size;
-    if (par->extradata_size > 0)
-    {
+    if (par->extradata_size > 0) {
         web_stream.extradata = std::vector<uint8_t>(par->extradata, par->extradata + par->extradata_size);
-    }
-    else
-    {
+    } else {
         web_stream.extradata = std::vector<uint8_t>();
     }
-
     web_stream.start_time = stream->start_time * av_q2d(stream->time_base);
-    web_stream.duration = stream->duration > 0 ? stream->duration * av_q2d(stream->time_base) : fmt_ctx->duration * av_q2d(AV_TIME_BASE_Q); // TODO: some file type can not get stream duration
-
+    web_stream.duration = stream->duration > 0 ? stream->duration * av_q2d(stream->time_base) : fmt_ctx->duration * av_q2d(AV_TIME_BASE_Q);
     int64_t nb_frames = stream->nb_frames;
-
-    // vp8 codec does not have nb_frames
-    if (nb_frames == 0)
-    {
+    if (nb_frames == 0 && stream->avg_frame_rate.den != 0) {
         nb_frames = (fmt_ctx->duration * (double)stream->avg_frame_rate.num) / ((double)stream->avg_frame_rate.den * AV_TIME_BASE);
     }
     web_stream.nb_frames = std::to_string(nb_frames);
-
     AVDictionaryEntry *tag = NULL;
-    while ((tag = av_dict_get(stream->metadata, "", tag, AV_DICT_IGNORE_SUFFIX)))
-    {
-        Tag t = {
-            .key = safe_str(tag->key),
-            .value = safe_str(tag->value)
-        };
+    while ((tag = av_dict_get(stream->metadata, "", tag, AV_DICT_IGNORE_SUFFIX))) {
+        Tag t = { .key = safe_str(tag->key), .value = safe_str(tag->value) };
         web_stream.tags.push_back(t);
     }
 }
 
-WebAVStream get_av_stream(std::string filename, int type, int wanted_stream_nb)
-{
-    AVFormatContext *fmt_ctx = NULL;
-    int ret;
+intptr_t open_source(val io_handler, int buffer_size) {
+    av_log_set_level(AV_LOG_QUIET);
+    DemuxerContext *ctx = new DemuxerContext();
+    ctx->io_handler = io_handler;
+    ctx->fmt_ctx = avformat_alloc_context();
+    ctx->avio_ctx_buffer = (uint8_t *)av_malloc(buffer_size);
+    ctx->avio_ctx = avio_alloc_context(
+        ctx->avio_ctx_buffer, buffer_size, 0, ctx,
+        &read_packet, NULL, &seek
+    );
 
-    if ((ret = avformat_open_input(&fmt_ctx, filename.c_str(), NULL, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot open input file");
+    if (!ctx->avio_ctx) {
+        av_free(ctx->avio_ctx_buffer);
+        avformat_free_context(ctx->fmt_ctx);
+        delete ctx;
+        throw std::runtime_error("Cannot allocate AVIOContext");
     }
 
-    if ((ret = avformat_find_stream_info(fmt_ctx, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find stream information\n");
-        avformat_close_input(&fmt_ctx);
+    ctx->fmt_ctx->pb = ctx->avio_ctx;
+
+    int ret = avformat_open_input(&ctx->fmt_ctx, NULL, NULL, NULL);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+        av_free(ctx->avio_ctx->buffer);
+        avio_context_free(&ctx->avio_ctx);
+        avformat_free_context(ctx->fmt_ctx);
+        delete ctx;
+        throw std::runtime_error("Cannot open input source");
+    }
+
+    if (avformat_find_stream_info(ctx->fmt_ctx, NULL) < 0) {
+        avformat_close_input(&ctx->fmt_ctx);
+        delete ctx;
         throw std::runtime_error("Cannot find stream information");
     }
 
-    int stream_index = av_find_best_stream(fmt_ctx, (AVMediaType)type, wanted_stream_nb, -1, NULL, 0);
-
-    if (stream_index < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find wanted stream in the input file\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot find wanted stream in the input file");
-    }
-
-    AVStream *stream = fmt_ctx->streams[stream_index];
-    WebAVStream web_stream;
-
-    gen_web_stream(web_stream, stream, fmt_ctx);
-
-    avformat_close_input(&fmt_ctx);
-
-    return web_stream;
+    intptr_t handle = reinterpret_cast<intptr_t>(ctx);
+    context_map[handle] = ctx;
+    return handle;
 }
 
-WebAVStreamList get_av_streams(std::string filename)
-{
-    AVFormatContext *fmt_ctx = NULL;
-    int ret;
-
-    if ((ret = avformat_open_input(&fmt_ctx, filename.c_str(), NULL, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot open input file");
+void close_source(intptr_t context_handle) {
+    if (context_map.find(context_handle) == context_map.end()) {
+        return;
     }
-
-    if ((ret = avformat_find_stream_info(fmt_ctx, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find stream information\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot find stream information");
-    }
-
-    int num_streams = fmt_ctx->nb_streams;
-
-    WebAVStreamList stream_list = {
-        .size = num_streams,
-        .streams = std::vector<WebAVStream>(num_streams),
-    };
-
-    for (int stream_index = 0; stream_index < num_streams; stream_index++)
-    {
-        AVStream *stream = fmt_ctx->streams[stream_index];
-
-        gen_web_stream(stream_list.streams[stream_index], stream, fmt_ctx);
-    }
-
-    avformat_close_input(&fmt_ctx);
-
-    return stream_list;
+    DemuxerContext *ctx = context_map[context_handle];
+    avformat_close_input(&ctx->fmt_ctx);
+    delete ctx;
+    context_map.erase(context_handle);
 }
 
-WebMediaInfo get_media_info(std::string filename) {
-    AVFormatContext *fmt_ctx = NULL;
-    int ret;
-
-    if ((ret = avformat_open_input(&fmt_ctx, filename.c_str(), NULL, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot open input file");
+WebMediaInfo get_media_info(intptr_t context_handle) {
+    if (context_map.find(context_handle) == context_map.end()) {
+        throw std::runtime_error("Invalid context handle");
     }
-
-    if ((ret = avformat_find_stream_info(fmt_ctx, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find stream information\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot find stream information");
-    }
+    DemuxerContext *ctx = context_map[context_handle];
+    AVFormatContext *fmt_ctx = ctx->fmt_ctx;
 
     int num_streams = fmt_ctx->nb_streams;
-
     WebMediaInfo media_info = {
         .format_name = fmt_ctx->iformat->name,
         .start_time = fmt_ctx->start_time * av_q2d(AV_TIME_BASE_Q),
@@ -379,249 +283,111 @@ WebMediaInfo get_media_info(std::string filename) {
         .streams = std::vector<WebAVStream>(num_streams),
     };
 
-    for (int stream_index = 0; stream_index < num_streams; stream_index++)
-    {
+    for (int stream_index = 0; stream_index < num_streams; stream_index++) {
         AVStream *stream = fmt_ctx->streams[stream_index];
-
         gen_web_stream(media_info.streams[stream_index], stream, fmt_ctx);
     }
-
-    avformat_close_input(&fmt_ctx);
-
     return media_info;
 }
 
-WebAVPacket get_av_packet(std::string filename, double timestamp, int type, int wanted_stream_nb, int seek_flag)
-{
-    AVFormatContext *fmt_ctx = NULL;
-    int ret;
-
-    if ((ret = avformat_open_input(&fmt_ctx, filename.c_str(), NULL, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot open input file");
+WebAVPacket get_av_packet(intptr_t context_handle, int type, int wanted_stream_nb, double timestamp, int seek_flag) {
+    if (context_map.find(context_handle) == context_map.end()) {
+        throw std::runtime_error("Invalid context handle");
     }
-
-    if ((ret = avformat_find_stream_info(fmt_ctx, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find stream information\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot find stream information");
-    }
+    DemuxerContext *demux_ctx = context_map[context_handle];
+    AVFormatContext *fmt_ctx = demux_ctx->fmt_ctx;
 
     int stream_index = av_find_best_stream(fmt_ctx, (AVMediaType)type, wanted_stream_nb, -1, NULL, 0);
-
-    if (stream_index < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find wanted stream in the input file\n");
-        avformat_close_input(&fmt_ctx);
+    if (stream_index < 0) {
         throw std::runtime_error("Cannot find wanted stream in the input file");
     }
 
-    AVPacket *packet = NULL;
-    packet = av_packet_alloc();
-
-    if (!packet)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot allocate packet\n");
-        avformat_close_input(&fmt_ctx);
+    AVPacket *packet = av_packet_alloc();
+    if (!packet) {
         throw std::runtime_error("Cannot allocate packet");
     }
 
     int64_t int64_timestamp = (int64_t)(timestamp * AV_TIME_BASE);
     int64_t seek_time_stamp = av_rescale_q(int64_timestamp, AV_TIME_BASE_Q, fmt_ctx->streams[stream_index]->time_base);
 
-    if ((ret = av_seek_frame(fmt_ctx, stream_index, seek_time_stamp, seek_flag)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot seek to the specified timestamp\n");
-        avformat_close_input(&fmt_ctx);
-        av_packet_unref(packet);
+    if (av_seek_frame(fmt_ctx, stream_index, seek_time_stamp, seek_flag) < 0) {
         av_packet_free(&packet);
         throw std::runtime_error("Cannot seek to the specified timestamp");
     }
 
-    while (av_read_frame(fmt_ctx, packet) >= 0)
-    {
-        if (packet->stream_index == stream_index)
-        {
+    while (av_read_frame(fmt_ctx, packet) >= 0) {
+        if (packet->stream_index == stream_index) {
             break;
         }
         av_packet_unref(packet);
     }
 
-    if (!packet)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Failed to get av packet at timestamp\n");
-        avformat_close_input(&fmt_ctx);
+    if (!packet->data) {
+        av_packet_free(&packet);
         throw std::runtime_error("Failed to get av packet at timestamp");
     }
 
     WebAVPacket web_packet;
-
     gen_web_packet(web_packet, packet, fmt_ctx->streams[stream_index]);
 
-    avformat_close_input(&fmt_ctx);
     av_packet_unref(packet);
     av_packet_free(&packet);
 
     return web_packet;
 }
 
-WebAVPacketList get_av_packets(std::string filename, double timestamp, int seek_flag)
-{
-    AVFormatContext *fmt_ctx = NULL;
-    int ret;
-
-    if ((ret = avformat_open_input(&fmt_ctx, filename.c_str(), NULL, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot open input file");
+int read_av_packet(intptr_t context_handle, double start, double end, int type, int wanted_stream_nb, int seek_flag, val js_caller) {
+    if (context_map.find(context_handle) == context_map.end()) {
+        throw std::runtime_error("Invalid context handle");
     }
-
-    if ((ret = avformat_find_stream_info(fmt_ctx, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find stream information\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot find stream information");
-    }
-
-    int num_streams = fmt_ctx->nb_streams;
-    int num_packets = num_streams;
-    WebAVPacketList web_packet_list = {
-        .size = num_packets,
-        .packets = std::vector<WebAVPacket>(num_packets),
-    };
-
-    AVPacket *packet = NULL;
-    packet = av_packet_alloc();
-
-    if (!packet)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot allocate packet\n");
-        avformat_close_input(&fmt_ctx);
-        throw std::runtime_error("Cannot allocate packet");
-    }
-
-    for (int stream_index = 0; stream_index < num_streams; stream_index++)
-    {
-        int64_t int64_timestamp = (int64_t)(timestamp * AV_TIME_BASE);
-        int64_t seek_time_stamp = av_rescale_q(int64_timestamp, AV_TIME_BASE_Q, fmt_ctx->streams[stream_index]->time_base);
-
-        if ((ret = av_seek_frame(fmt_ctx, stream_index, seek_time_stamp, seek_flag)) < 0)
-        {
-            av_log(NULL, AV_LOG_ERROR, "Cannot seek to the specified timestamp\n");
-            throw std::runtime_error("Cannot seek to the specified timestamp");
-        }
-
-        while (av_read_frame(fmt_ctx, packet) >= 0)
-        {
-            if (packet->stream_index == stream_index)
-            {
-                break;
-            }
-            av_packet_unref(packet);
-        }
-
-        if (!packet)
-        {
-            av_log(NULL, AV_LOG_ERROR, "Failed to get av packet at timestamp\n");
-            throw std::runtime_error("Failed to get av packet at timestamp");
-        }
-
-        gen_web_packet(web_packet_list.packets[stream_index], packet, fmt_ctx->streams[stream_index]);
-    }
-
-    av_packet_unref(packet);
-    av_packet_free(&packet);
-    avformat_close_input(&fmt_ctx);
-
-    return web_packet_list;
-}
-
-int read_av_packet(std::string filename, double start, double end, int type, int wanted_stream_nb, int seek_flag, val js_caller)
-{
-    AVFormatContext *fmt_ctx = NULL;
-    int ret;
-
-    if ((ret = avformat_open_input(&fmt_ctx, filename.c_str(), NULL, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
-        avformat_close_input(&fmt_ctx);
-        return 0;
-    }
-
-    if ((ret = avformat_find_stream_info(fmt_ctx, NULL)) < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find stream information\n");
-        avformat_close_input(&fmt_ctx);
-        return 0;
-    }
+    DemuxerContext *demux_ctx = context_map[context_handle];
+    AVFormatContext *fmt_ctx = demux_ctx->fmt_ctx;
 
     int stream_index = av_find_best_stream(fmt_ctx, (AVMediaType)type, wanted_stream_nb, -1, NULL, 0);
 
-    if (stream_index < 0)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find wanted stream in the input file\n");
-        avformat_close_input(&fmt_ctx);
-        return 0;
+    if (stream_index < 0) {
+        throw std::runtime_error("Cannot find wanted stream in the input file");
     }
 
     AVPacket *packet = NULL;
     packet = av_packet_alloc();
 
-    if (!packet)
-    {
-        av_log(NULL, AV_LOG_ERROR, "Cannot allocate packet\n");
-        avformat_close_input(&fmt_ctx);
-        return 0;
+    if (!packet) {
+        throw std::runtime_error("Cannot allocate packet");
     }
 
-    if (start > 0)
-    {
+    if (start > 0) {
         int64_t start_timestamp = (int64_t)(start * AV_TIME_BASE);
         int64_t rescaled_start_time_stamp = av_rescale_q(start_timestamp, AV_TIME_BASE_Q, fmt_ctx->streams[stream_index]->time_base);
 
-        if ((ret = av_seek_frame(fmt_ctx, stream_index, rescaled_start_time_stamp, seek_flag)) < 0)
-        {
-            av_log(NULL, AV_LOG_ERROR, "Cannot seek to the specified timestamp\n");
-            avformat_close_input(&fmt_ctx);
-            av_packet_unref(packet);
+        if (av_seek_frame(fmt_ctx, stream_index, rescaled_start_time_stamp, seek_flag) < 0) {
             av_packet_free(&packet);
-            return 0;
+            throw std::runtime_error("Cannot seek to the specified timestamp");
         }
     }
 
-    while (av_read_frame(fmt_ctx, packet) >= 0)
-    {
-        if (packet->stream_index == stream_index)
-        {
+    while (av_read_frame(fmt_ctx, packet) >= 0) {
+        if (packet->stream_index == stream_index) {
             WebAVPacket web_packet;
 
             gen_web_packet(web_packet, packet, fmt_ctx->streams[stream_index]);
 
-            if (end > 0 && web_packet.timestamp > end)
-            {
+            if (end > 0 && web_packet.timestamp > end) {
                 break;
             }
 
-            // call js method to send packet
             val result = js_caller.call<val>("sendAVPacket", web_packet).await();
             int send_result = result.as<int>();
 
-            if (send_result == 0)
-            {
+            if (send_result == 0) {
                 break;
             }
         }
         av_packet_unref(packet);
     }
 
-    // call js method to end send packet
     js_caller.call<val>("sendAVPacket", 0).await();
 
-    avformat_close_input(&fmt_ctx);
     av_packet_unref(packet);
     av_packet_free(&packet);
 
@@ -632,13 +398,12 @@ void set_av_log_level(int level) {
     av_log_set_level(level);
 }
 
-EMSCRIPTEN_BINDINGS(web_demuxer)
-{
+EMSCRIPTEN_BINDINGS(web_demuxer) {
     value_object<Tag>("Tag")
         .field("key", &Tag::key)
         .field("value", &Tag::value);
-    
-     class_<WebAVStream>("WebAVStream")
+
+    class_<WebAVStream>("WebAVStream")
         .constructor<>()
         .property("index", &WebAVStream::index)
         .property("id", &WebAVStream::id)
@@ -647,34 +412,18 @@ EMSCRIPTEN_BINDINGS(web_demuxer)
         .property("codec_name", &WebAVStream::codec_name)
         .property("codec_string", &WebAVStream::codec_string)
         .property("profile", &WebAVStream::profile)
-        .property("pix_fmt", &WebAVStream::pix_fmt)
         .property("level", &WebAVStream::level)
-        .property("width", &WebAVStream::width)
-        .property("height", &WebAVStream::height)
         .property("channels", &WebAVStream::channels)
         .property("sample_rate", &WebAVStream::sample_rate)
         .property("sample_fmt", &WebAVStream::sample_fmt)
         .property("bit_rate", &WebAVStream::bit_rate)
         .property("extradata_size", &WebAVStream::extradata_size)
-        .property("extradata", &WebAVStream::get_extradata) // export extradata as typed_memory_view
-        .property("r_frame_rate", &WebAVStream::r_frame_rate)
-        .property("avg_frame_rate", &WebAVStream::avg_frame_rate)
-        .property("sample_aspect_ratio", &WebAVStream::sample_aspect_ratio)
-        .property("display_aspect_ratio", &WebAVStream::display_aspect_ratio)
+        .property("extradata", &WebAVStream::get_extradata)
         .property("start_time", &WebAVStream::start_time)
         .property("duration", &WebAVStream::duration)
-        .property("rotation", &WebAVStream::rotation)
         .property("nb_frames", &WebAVStream::nb_frames)
-        .property("tags", &WebAVStream::get_tags)
-        .property("color_primaries", &WebAVStream::color_primaries)
-        .property("color_transfer", &WebAVStream::color_transfer)
-        .property("color_space", &WebAVStream::color_space)
-        .property("color_range", &WebAVStream::color_range);
-
-
-    value_object<WebAVStreamList>("WebAVStreamList")
-        .field("size", &WebAVStreamList::size)
-        .field("streams", &WebAVStreamList::streams);
+        .property("mime_type", &WebAVStream::mime_type)
+        .property("tags", &WebAVStream::get_tags);
 
     value_object<WebMediaInfo>("WebMediaInfo")
         .field("format_name", &WebMediaInfo::format_name)
@@ -688,26 +437,22 @@ EMSCRIPTEN_BINDINGS(web_demuxer)
 
     class_<WebAVPacket>("WebAVPacket")
         .constructor<>()
+        .property("stream_index", &WebAVPacket::stream_index)
         .property("keyframe", &WebAVPacket::keyframe)
         .property("timestamp", &WebAVPacket::timestamp)
         .property("duration", &WebAVPacket::duration)
         .property("size", &WebAVPacket::size)
-        .property("data", &WebAVPacket::get_data); // export data as typed_memory_view
+        .property("data", &WebAVPacket::get_data);
 
-    value_object<WebAVPacketList>("WebAVPacketList")
-        .field("size", &WebAVPacketList::size)
-        .field("packets", &WebAVPacketList::packets);
-
-    function("get_av_stream", &get_av_stream, return_value_policy::take_ownership());
-    function("get_av_streams", &get_av_streams, return_value_policy::take_ownership());
+    function("open_source", select_overload<intptr_t(val, int)>(&open_source));
+    function("close_source", &close_source);
     function("get_media_info", &get_media_info, return_value_policy::take_ownership());
     function("get_av_packet", &get_av_packet, return_value_policy::take_ownership());
-    function("get_av_packets", &get_av_packets, return_value_policy::take_ownership());
     function("read_av_packet", &read_av_packet);
+
     function("set_av_log_level", &set_av_log_level);
 
     register_vector<uint8_t>("vector<uint8_t>");
     register_vector<Tag>("vector<Tag>");
     register_vector<WebAVStream>("vector<WebAVStream>");
-    register_vector<WebAVPacket>("vector<WebAVPacket>");
 }

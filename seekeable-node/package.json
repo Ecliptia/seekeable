@@ -1,0 +1,12 @@
+{
+  "name": "@ecliptia/seekeable-node",
+  "version": "1.1.1-ecliptia.2",
+  "description": "A Node.js demuxer for seeking remote media files (audio only).",
+  "main": "src/index.js",
+  "type": "module",
+  "license": "MIT",
+  "dependencies": {
+    "undici": "^5.28.3"
+  }
+}
+ 
